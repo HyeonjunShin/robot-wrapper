@@ -138,32 +138,116 @@ def solve_offline_ik(target_pos, target_rot, q_init, max_iter=100, tol=1e-4):
             q[i] = np.clip(q[i], JOINT_LIMITS[i][0], JOINT_LIMITS[i][1])
         
     return q, False
+# =====================================================================
+# 2. 로봇 하드웨어 및 시뮬레이터 추상화 인터페이스
+# =====================================================================
+class RobotInterface:
+    def connect(self):
+        """로봇 컨트롤러 또는 시뮬레이터에 연결합니다."""
+        raise NotImplementedError
+
+    def send_and_receive(self, q_cmd: np.ndarray) -> np.ndarray:
+        """목표 관절각을 보내고, 로봇 엔코더로부터 실시간 실제 관절각을 읽어 반환합니다."""
+        raise NotImplementedError
+
+    def disconnect(self):
+        """연결을 해제하고 리소스를 정리합니다."""
+        raise NotImplementedError
+
+
+class MuJoCoSocketInterface(RobotInterface):
+    """
+    MuJoCo 시뮬레이터(sim_server.py)와 소켓 통신을 담당하는 인터페이스
+    """
+    def __init__(self, host='127.0.0.1', port=50005):
+        self.host = host
+        self.port = port
+        self.client = None
+
+    def connect(self):
+        self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.client.connect((self.host, self.port))
+            print(f"✅ MuJoCo 시뮬레이터 서버 연결 완료! ({self.host}:{self.port})")
+        except Exception as e:
+            print(f"❌ 시뮬레이터 서버 연결 실패: {e}")
+            print("먼저 py/sim_server.py를 실행해 두었는지 확인하세요.")
+            raise e
+
+    def send_and_receive(self, q_cmd: np.ndarray) -> np.ndarray:
+        # 목표 각도 전송
+        send_bytes = struct.pack('6d', *q_cmd)
+        self.client.sendall(send_bytes)
+        
+        # 실제 각도 피드백 수신
+        recv_bytes = self.client.recv(48)
+        if not recv_bytes:
+            raise ConnectionError("❌ MuJoCo 서버로부터 데이터를 받지 못했습니다. 연결이 강제 종료되었을 수 있습니다.")
+        return np.array(struct.unpack('6d', recv_bytes))
+
+    def disconnect(self):
+        if self.client:
+            self.client.close()
+            print("🔌 MuJoCo 소켓 연결을 종료했습니다.")
+
+
+class RealRobotInterfacePlaceholder(RobotInterface):
+    """
+    실제 협동 로봇(예: 두산 로봇 M1013)으로 알고리즘을 이식할 때 사용할 드라이버 템플릿
+    """
+    def __init__(self, ip='192.168.1.100'):
+        self.ip = ip
+        # self.api = DoosanRobotAPI(ip)  # 실제 로봇 SDK 인스턴스
+
+    def connect(self):
+        print(f"🔌 실제 로봇 컨트롤러({self.ip})와 통신을 시작합니다...")
+        # self.api.connect()
+
+    def send_and_receive(self, q_cmd: np.ndarray) -> np.ndarray:
+        # [실제 로봇 이식 코드 예시]
+        # 1. 로봇에 관절 제어 패킷 전송 (예: servoj)
+        # self.api.servoj(q_cmd, time=0.01)
+        
+        # 2. 로봇 엔코더로부터 실제 피드백 각도 수신
+        # q_curr = self.api.get_actual_joint_position()
+        
+        # (시뮬레이션 검증용 임시 가상 데이터 반환)
+        q_curr = np.copy(q_cmd)
+        return q_curr
+
+    def disconnect(self):
+        print("🔌 실제 로봇과 통신을 안전하게 종료하고 모터를 정지합니다.")
+        # self.api.disconnect()
+
 
 # =====================================================================
-# 2. 메인 소켓 클라이언트 및 제어 루프
+# 3. 메인 제어 루프
 # =====================================================================
 def main():
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # ----------------------------------------------------
+    # [제어 대상 선택] 아래 두 줄 중 하나만 주석 해제하여 사용하십시오.
+    # ----------------------------------------------------
+    robot = MuJoCoSocketInterface(host='127.0.0.1', port=50005)      # 시뮬레이터 모드
+    # robot = RealRobotInterfacePlaceholder(ip='192.168.1.100')     # 실제 로봇 모드
+    # ----------------------------------------------------
+
     try:
-        client.connect(('127.0.0.1', 50005))
-        print("✅ MuJoCo 시뮬레이터 서버 연결 완료!")
-    except Exception as e:
-        print(f"❌ 서버 연결 실패: {e}")
-        print("먼저 py/sim_server.py를 실행하세요.")
+        robot.connect()
+    except Exception:
         return
 
     # 제어 변수 설정
     dt = 0.01  # 제어 루프 주기 (10ms / 100Hz)
-    kp = 5.0   # 비례 게인
+    kp = 15.0  # 비례 게인 (오차 피드백 세기)
     damping = 0.02  # 특이점 회피 감쇠 계수
     
     # 궤적 명령어 변수 (YZ 평면의 원 궤적)
-    center_pos = np.array([0.5, 0.0, 0.4])  # 원 중심 (X, Y, Z)
+    center_pos = np.array([0.4, 0.0, 0.6])   # 원 중심 (X, Y, Z) - 작업 반경 내 안전 위치
     radius = 0.1                            # 원 반지름 (10cm)
     omega = 1.0                             # 회전 속도 (rad/s)
     
     # 목표 방향 (카메라가 바닥을 향하도록 피치 180도 회전 상태 유지)
-    target_rot = rot_z(0) @ rot_y(np.radians(180)) @ rot_x(0)
+    target_rot = rot_z(0) @ rot_y(0) @ rot_x(0)
     
     # t = 0 일 때의 시작 타겟 포즈 계산
     start_target_pos = np.array([
@@ -172,12 +256,14 @@ def main():
         center_pos[2] + radius * np.cos(0)
     ])
     
-    # 1. 초기 임의의 위치(0도 상태) 수신
-    # 기본 자세를 서버에 한번 보낸 후 현재 시뮬레이터 로봇 각도를 가져옴
+    # 1. 초기 임의의 위치(0도 상태) 전송하여 현재 로봇 실제 각도를 가져옴
     temp_initial_q = np.zeros(6)
-    client.sendall(struct.pack('6d', *temp_initial_q))
-    recv_bytes = client.recv(48)
-    q_initial_curr = np.array(struct.unpack('6d', recv_bytes))
+    try:
+        q_initial_curr = robot.send_and_receive(temp_initial_q)
+    except Exception as e:
+        print(f"초기 각도 수신 실패: {e}")
+        robot.disconnect()
+        return
     
     print("🔄 [초기화] 원형 궤적 시작 위치로 로봇 정렬 중...")
     
@@ -194,8 +280,12 @@ def main():
     for s in range(steps):
         t_frac = s / (steps - 1)
         q_interp = (1 - t_frac) * q_initial_curr + t_frac * q_start
-        client.sendall(struct.pack('6d', *q_interp))
-        client.recv(48)
+        try:
+            robot.send_and_receive(q_interp)
+        except Exception as e:
+            print(f"정렬 중 에러 발생: {e}")
+            robot.disconnect()
+            return
         time.sleep(0.01)
         
     print("✅ 정렬 완료. 실시간 원형 궤적 추적 제어를 시작합니다. (RMRC)")
@@ -211,11 +301,18 @@ def main():
             loop_start = time.time()
             t = loop_start - start_time
             
-            # 1. 실시간 목표 TCP 위치 생성 (원형 궤적)
+            # 1. 실시간 목표 TCP 위치 및 속도 생성 (원형 궤적)
             target_pos = np.array([
                 center_pos[0],
                 center_pos[1] + radius * np.sin(omega * t),
                 center_pos[2] + radius * np.cos(omega * t)
+            ])
+            # 원형 궤적의 실시간 접선 속도 (Feedforward velocity)
+            target_vel = np.array([
+                0.0,
+                omega * radius * np.cos(omega * t),
+                -omega * radius * np.sin(omega * t),
+                0.0, 0.0, 0.0 # 방향 속도는 0 유지
             ])
             
             # 2. 현재 로봇 실제 TCP 상태 계산 (Forward Kinematics)
@@ -243,8 +340,8 @@ def main():
             inv_part = np.linalg.inv(J_JT + damping_matrix)
             J_damped_inv = J.T @ inv_part
             
-            # 6. 관절속도 계산 및 적분을 통한 관절 목표각 생성
-            q_vel = J_damped_inv @ (kp * error_total)
+            # 6. 관절속도 계산 (피드포워드 속도 + 피드백 제어) 및 적분을 통한 목표각 생성
+            q_vel = J_damped_inv @ (target_vel + kp * error_total)
             
             # 속도 한계 제한 (안전장치: 최대 1.5 rad/s)
             q_vel = np.clip(q_vel, -1.5, 1.5)
@@ -255,14 +352,11 @@ def main():
                 q_cmd[i] = np.clip(q_cmd[i], JOINT_LIMITS[i][0], JOINT_LIMITS[i][1])
             
             # 7. 목표 각도 전송 및 현재 실제 각도 수신
-            send_bytes = struct.pack('6d', *q_cmd)
-            client.sendall(send_bytes)
-            
-            recv_bytes = client.recv(48)
-            if not recv_bytes:
-                print("❌ 서버로부터 데이터를 받지 못했습니다.")
+            try:
+                q_curr = robot.send_and_receive(q_cmd)
+            except Exception as e:
+                print(f"\n❌ 실시간 제어 루프 통신 실패: {e}")
                 break
-            q_curr = np.array(struct.unpack('6d', recv_bytes))
             
             # 8. 주기적인 실시간 오차 출력 (mm 단위 환산)
             tracking_err_norm = np.linalg.norm(error_pos)
@@ -277,8 +371,7 @@ def main():
     except KeyboardInterrupt:
         print("\n🛑 사용자에 의해 제어가 중지되었습니다.")
     finally:
-        client.close()
-        print("🔌 소켓 연결을 종료했습니다.")
+        robot.disconnect()
 
 if __name__ == "__main__":
     main()

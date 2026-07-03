@@ -100,7 +100,7 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
             current_qpos = np.array(data.qpos[joint_qpos_adr])
             local_current_vel = np.array(data.qvel[joint_qvel_adr])
             
-        # PD 관절 제어 토크 계산
+        # PD 관절 제어 토크 계산 (중력 보상 제거하여 수치적 안정성 확보)
         error = local_target - current_qpos
         ctrl_torque = kp * error - kd * local_current_vel
         
